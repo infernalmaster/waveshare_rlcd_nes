@@ -6,7 +6,6 @@ Reflective panels have no backlight — they are readable in direct sunlight and
 
 Everything needed is in this repository. Open `waveshare_rlcd_nes.ino` in the Arduino IDE and press Upload.
 
-> **Status.** Verified on hardware on 2026-08-30: Super Mario Bros at 60 emulated fps, `dither=2850us push=6579us emul_fps=60`. Since that measurement the video path changed — flushes moved from a timer to the panel's TE pin — and **that change has not been re-verified on hardware.** The host tests pass; the board has not been reflashed. If `te_hz=0` appears in the serial log, that lock was never acquired; see [Troubleshooting](#tearing-or-te_hz0).
 
 ## Features
 
@@ -27,7 +26,7 @@ Everything needed is in this repository. Open `waveshare_rlcd_nes.ino` in the Ar
 |---|---|
 | Board | Waveshare ESP32-S3-RLCD-4.2 (N16R8) |
 | Library | `NimBLE-Arduino` 2.x — **only** if you want the Bluetooth keyboard |
-| ROM | built in — see [below](#getting-a-game-on-it). No card needed as shipped |
+| TF card | FAT32, `.nes` files in the root — see [below](#getting-a-game-on-it). Or embed a ROM and need no card at all |
 | Buttons | optional. The board's own BOOT and KEY buttons are enough to navigate |
 
 **There is no emulator library to install.** The Nofrendo core lives in [src/nofrendo/](src/nofrendo); Arduino compiles a sketch's `src/` subfolder recursively, so it builds with the sketch. It is a fork with ST7305 support added — an installed copy of the upstream library will not build this sketch, and should be removed if you have one.
@@ -42,27 +41,17 @@ Everything needed is in this repository. Open `waveshare_rlcd_nes.ino` in the Ar
 | Partition Scheme | any with ≥ 3 MB app |
 | USB CDC On Boot | Enabled — for the serial pad and the log |
 
-Then Upload. On first boot the board scans for a Bluetooth keyboard (skip with any button), then starts the built-in game.
+Then Upload. On first boot the board scans for a Bluetooth keyboard (skip with any button), then shows the ROM browser.
 
 Watch the serial log at **115200** — it narrates everything, and every troubleshooting section below is written around one line of it.
 
 ## Getting a game on it
 
-`NES_EMBEDDED_ROM` in [hw_config.h](hw_config.h) picks between two routes.
-
-### Built into the binary
-
-The default. The game is compiled in and the board boots straight into it, with no card and no browser. To change the game:
-
-```sh
-python3 tools/embed_rom.py SomeOtherGame.nes   # regenerates nes_rom_data.h
-```
-
-The array is `const`, so it stays in memory-mapped flash and costs **no RAM** — 256 KB of the app partition and about 1.4 MB of generated C source, nothing more.
+`NES_EMBEDDED_ROM` in [hw_config.h](hw_config.h) picks between two routes. It ships at **0** — browse a TF card.
 
 ### From a TF card
 
-Set `NES_EMBEDDED_ROM` to **0** and put `.nes` files in the **root** of the card. Files in folders are not found.
+The default. Put `.nes` files in the **root** of the card; files in folders are not found. The board shows a browser at boot and after every game.
 
 The card must be **FAT32**. ESP-IDF builds FatFs with exFAT off and exposes no switch for it, so an exFAT card simply fails to mount and the browser shows an empty list — which looks like a dead card rather than a wrong format. Both Disk Utility and the official SD Card Formatter default to exFAT above 32 GB, so on a large card force it:
 
@@ -71,6 +60,16 @@ diskutil eraseDisk "MS-DOS FAT32" NES MBRFormat /dev/diskN   # check diskN twice
 ```
 
 `MBRFormat` matters — with GPT neither card readers nor the ESP32 will see it.
+
+### Built into the binary
+
+Set `NES_EMBEDDED_ROM` to **1** and no card is needed: the game is compiled in and the board boots straight into it, with no browser. A ROM is already embedded in `nes_rom_data.h`. To change it:
+
+```sh
+python3 tools/embed_rom.py SomeOtherGame.nes   # regenerates nes_rom_data.h
+```
+
+The array is `const`, so it stays in memory-mapped flash and costs **no RAM** — 256 KB of the app partition and about 1.4 MB of generated C source, nothing more.
 
 ### Swapping the card
 
@@ -276,9 +275,9 @@ Every pin and switch is in [hw_config.h](hw_config.h), which is read by the sket
 
 | | |
 |---|---|
-| `NES_EMBEDDED_ROM` | 1 = play the ROM built into the binary, 0 = browse a TF card |
+| `NES_EMBEDDED_ROM` | **0** — browse a TF card. 1 = play the ROM built into the binary |
 | `NES_PANEL_FPS` | panel scan rate. Every rung up to 23.22 Hz is clean; above ~26 Hz the blacks wash out |
-| `NES_MONO_MODE` | which of the eight reductions to start on |
+| `NES_MONO_MODE` | which of the eight reductions to start on. **`ST7305_MONO_BAYER2`** |
 | `NES_MONO_GAMMA` / `NES_MONO_CONTRAST` | tone before the reduction. No chord for these |
 | `NES_DITHER_ON_CORE0` | dither on the second core. On by default; costs 122 KB of PSRAM |
 | `NES_BLE_KEYBOARD` | the Bluetooth keyboard client, and the picker at boot |
@@ -312,9 +311,9 @@ The consequence is that there is no margin left. Every one of the 15000 GRAM byt
 
 | | | |
 |---|---|---|
-| `BAY4` | Bayer 4×4, 16 levels | the original and still the default; a fine diagonal cross-hatch |
+| `BAY4` | Bayer 4×4, 16 levels | the original; a fine diagonal cross-hatch |
 | `BAY8` | Bayer 8×8, 64 levels | smoother gradients, a NES sky stops banding; coarser weave in flat areas |
-| `BAY2` | Bayer 2×2, 4 levels | almost no dither texture and much more contrast; flattens shading into blocks |
+| `BAY2` | Bayer 2×2, 4 levels | **the default.** Almost no dither texture and much more contrast; flattens shading into blocks |
 | `CLUS` | clustered-dot 4×4 | a newsprint halftone. Grows dots from a centre instead of scattering, which on a panel whose pixels bleed often reads cleaner than dispersed noise |
 | `BLUE` | blue noise 8×8 | void-and-cluster mask, same cost as `BAY8`. Grain instead of a weave — no cross-hatch at all |
 | `THRS` | no dither | every shade collapses, so pictures lose their modelling, but text and hard-edged sprite art come out perfectly crisp |

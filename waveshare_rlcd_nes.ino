@@ -21,10 +21,11 @@
  *       Partition Scheme 16M Flash (3MB APP/9.9MB FATFS) or any >=3 MB app
  *       USB CDC On Boot  Enabled            <- for the serial gamepad
  *
- *  3. Nothing else, as shipped: NES_EMBEDDED_ROM is 1, so the ROM in
- *     nes_rom_data.h is built into the binary and it boots straight into that
- *     game. Set it to 0 in hw_config.h to browse a FAT32 TF card instead
- *     (exFAT will not mount - ESP-IDF builds FatFs without it).
+ *  3. A TF card, as shipped: NES_EMBEDDED_ROM is 0, so the board browses the
+ *     card and plays what you pick. The card must be FAT32 with the .nes files
+ *     in its root - exFAT will not mount, because ESP-IDF builds FatFs without
+ *     it. Set the flag to 1 in hw_config.h to play the ROM already embedded in
+ *     nes_rom_data.h instead, which needs no card at all.
  *
  * The sketch folder also holds hw_config.h, st7305_gfx.h and st7305_tft.h. The
  * emulator core in src/nofrendo/ includes those from here - the Arduino builder
