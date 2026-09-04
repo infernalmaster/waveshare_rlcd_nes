@@ -2,6 +2,12 @@
 
 A NES emulator for the **Waveshare ESP32-S3-RLCD-4.2**, running on its 400×300 1-bit reflective LCD.
 
+<p align="center">
+  <a href="https://www.youtube.com/shorts/TS0uqq4QBnE">
+    <img src="https://img.youtube.com/vi/TS0uqq4QBnE/oardefault.jpg" width="300" alt="Super Mario Bros. running on the reflective panel — click to watch">
+  </a>
+</p>
+
 Reflective panels have no backlight — they are readable in direct sunlight and draw almost nothing — but they are black and white, and they are slow. This sketch takes Nofrendo's 256×240 colour output, reduces it to ink and paper through your choice of eight dither modes, stretches it to the panel's real 4∶3 geometry, and phase-locks the write to the panel's own scan so there is no tearing. The emulator itself runs at a full 60 fps; the panel shows as many of those frames as it can.
 
 Everything needed is in this repository. Open `waveshare_rlcd_nes.ino` in the Arduino IDE and press Upload.
