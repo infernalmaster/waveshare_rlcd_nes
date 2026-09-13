@@ -352,16 +352,19 @@
  * advertisement is often truncated - only about 29 bytes fit. */
 #define NES_BLE_KEYBOARD_NAME "Sofle"
 
-/* How long to wait at boot for the keyboard before starting the game anyway.
+/* How long the boot-time "waiting for keyboard" screen stays up.
  *
- * Generous on purpose. One scan alone is 5 s, and a first-time pairing adds
- * the encryption handshake and service discovery on top - so a short timeout
- * gives up while the thing is still working and looks like it never tried.
- * Nothing is lost by waiting: the game does not need the keyboard to start, and
- * the keyboard keeps connecting in the background if you skip.
+ * NES_BLE_WAIT_FOREVER, the default, means until the keyboard is actually
+ * delivering keys or a button is held: the ROM browser never opens on its own.
+ * That is deliberate. A timeout used to drop into the browser mid-pairing,
+ * which read as "it connected, but the keys do not work" - the status line
+ * saying why (a stale bond, a refused pairing) was on a screen that had just
+ * been replaced. With the wait open-ended that line stays in view until acted
+ * on, and holding any button is the way out when there is no keyboard today.
  *
- * Press any button to skip. 0 disables the wait entirely. */
-#define NES_BLE_WAIT_MS 60000
+ * A number of milliseconds restores a timeout; 0 disables the screen. */
+#define NES_BLE_WAIT_FOREVER 0xFFFFFFFFu
+#define NES_BLE_WAIT_MS NES_BLE_WAIT_FOREVER
 
 /* HID usage codes, Usage Page 0x07 - what the keyboard actually sends, not
  * ASCII. Letters run a=0x04..z=0x1D, digits 1=0x1E..9=0x26 then 0=0x27.

@@ -47,7 +47,7 @@ Everything needed is in this repository. Open `waveshare_rlcd_nes.ino` in the Ar
 | Partition Scheme | any with ≥ 3 MB app |
 | USB CDC On Boot | Enabled — for the serial pad and the log |
 
-Then Upload. On first boot the board scans for a Bluetooth keyboard (skip with any button), then shows the ROM browser.
+Then Upload. On boot the board offers a Bluetooth keyboard picker, then waits until that keyboard is paired and you have pressed one key on it before opening the ROM browser. The wait has no timeout: it shows the BLE status line together with what to do about it (a refused pairing, a stale bond, a ZMK profile that is not active) until you act on it, and holding any button plays without the keyboard. `NES_BLE_WAIT_MS` in [hw_config.h](hw_config.h) restores a timeout if you want one.
 
 Watch the serial log at **115200** — it narrates everything, and every troubleshooting section below is written around one line of it.
 
@@ -171,6 +171,7 @@ The fix is on the keyboard: `&bt BT_SEL <n>` until reports appear. Find the righ
 
 Two traps in the same area:
 
+- **The keyboard will not overwrite a bond it still holds.** When the board has forgotten its key but the keyboard has not, the serial log shows `pairing/encryption failed: status 0x503`: Zephyr refuses to replace a stored bond with a fresh Just Works pairing unless the keyboard was built with `CONFIG_BT_SMP_ALLOW_UNAUTH_OVERWRITE`, which ZMK leaves off. The bond is looked up by the board's address on *any* profile, so this is exactly the case for `BT_CLR_ALL`, or `BT_CLR` on the specific profile that was paired to the board.
 - **`BT_CLR` clears only the selected profile.** Clearing profile 0 does nothing to a bond living on profile 4. Worse, it leaves profile 0 empty *and active*, so the keyboard starts advertising as pairable again — which reads as "it never paired with the board", when in fact it is bonded on another profile.
 - **Bonds survive reflashing the keyboard.** MAC addresses and keys are stored separately from the firmware, so re-flashing ZMK to fix a tangled bond achieves nothing. Use `BT_CLR` / `BT_CLR_ALL`.
 

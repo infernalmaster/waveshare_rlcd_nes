@@ -53,6 +53,12 @@
 
 #define BOOT_PROTOCOL_MODE 0x00
 
+/* Shown once subscribed. Used twice, so it lives here rather than inline. */
+#define HINT_PRESS_A_KEY \
+    "Paired and subscribed. Press any key on the keyboard.\n" \
+    "If nothing happens: on ZMK, keys go only to the ACTIVE\n" \
+    "profile - select this board's profile with BT_SEL n."
+
 /* Appearance 0x03C1 = Generic HID / Keyboard. Some keyboards advertise the HID
  * service UUID, some only the appearance, so both are accepted. */
 #define APPEARANCE_KEYBOARD 0x03C1
@@ -94,6 +100,86 @@ static bool g_disabled = false;
  * "we closed the connection", which is true, useless, and hides the one line
  * worth reading. So a deliberate hang-up logs and leaves the status alone. */
 static volatile bool g_expect_disconnect = false;
+
+/* Set when pairing/encryption reaches a verdict, either way. secure_link()
+ * waits on it, because the library's own wait can return before pairing has
+ * finished - see there. Success arrives through onAuthenticationComplete;
+ * failure only through the raw GAP event, which is why gap_listener exists. */
+static volatile bool g_auth_done = false;
+
+/* The status of the last ENC_CHANGE, for the failure path to read after
+ * secure_link() gives up. 0 = success, -1 = never arrived. */
+static volatile int g_auth_status = -1;
+
+/* NimBLE status ranges (host/ble_hs.h): 0x100 ATT, 0x200 HCI, 0x400 an SMP
+ * failure WE sent, 0x500 an SMP failure the PEER sent. Easy to misread -
+ * 0x503 is the keyboard talking, not us. */
+#define ST_SM_OURS  0x400
+#define ST_SM_PEER  0x500
+#define ST_PEER_AUTH_REQUIREMENTS (ST_SM_PEER + 0x03)
+
+/* Human text for a NimBLE security status. Peer SMP failures are the
+ * interesting ones: the keyboard saying no, with the reason attached. */
+static const char *security_status(int st)
+{
+    if (st >= ST_SM_PEER && st < ST_SM_PEER + 0x100) {
+        switch (st - ST_SM_PEER) {
+        case 0x03: return "keyboard: authentication requirements. On Zephyr/ZMK "
+                          "this is \"I still have a bond for you and will not "
+                          "replace it with a new Just Works pairing\"";
+        case 0x05: return "keyboard: pairing not supported";
+        case 0x06: return "keyboard: encryption key size";
+        case 0x08: return "keyboard: unspecified - on ZMK, the active profile "
+                          "is taken by another host";
+        case 0x09: return "keyboard: repeated attempts - back off";
+        case 0x0b: return "keyboard: DHKey check failed";
+        default:   return "keyboard rejected the pairing";
+        }
+    }
+    if (st >= ST_SM_OURS && st < ST_SM_OURS + 0x100)
+        return "our side aborted the pairing";
+    if (st == 0x205) return "authentication failure";
+    if (st == 0x206) return "PIN or key missing - a bond only one side has";
+    if (st == 0x216) return "we closed the link";
+    return "";
+}
+
+/* Raw GAP listener, registered beside the client's own handler - NimBLE calls
+ * every listener for every event, so this takes nothing away from it.
+ *
+ * It exists because the client callbacks have no failure path: a Pairing
+ * Failed from the keyboard produces an ENC_CHANGE with a non-zero status that
+ * the library logs nowhere and reports to nobody. This is the only place the
+ * reason can be read, and the difference between "it never answered" and
+ * "it said no, and why" is the difference between a wiring hunt and pressing
+ * one key combination on the keyboard. */
+static int gap_listener(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type != BLE_GAP_EVENT_ENC_CHANGE) return 0;
+
+    const int st = event->enc_change.status;
+    if (st != 0) {
+        Serial.printf("[BLE] pairing/encryption failed: status 0x%x - %s\n",
+                      (unsigned)st, security_status(st));
+    }
+    g_auth_status = st;
+    g_auth_done = true;
+    return 0;
+}
+
+/* A few lines of "and here is what to do about it", for the wait screen.
+ * Always a string literal, so a pointer is a complete record of it and the
+ * screen can detect a change by comparing pointers. Lines are separated by
+ * '\n' and kept under 60 characters: the panel is 400 px wide, the small font
+ * is 6 px per character, and the text starts 20 px in. "" means no advice,
+ * and the screen shows the key legend in that space instead. */
+static const char *volatile g_hint = "";
+
+static void set_hint(const char *lit)
+{
+    g_hint = lit ? lit : "";
+}
 
 static void set_status(const char *fmt, ...)
 {
@@ -190,6 +276,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
          * until reports are flowing; saying "connected" here is what made the
          * first version report success while no key ever worked. */
         g_link_up = true;
+        set_hint("");
         set_status("linked: %s", client->getPeerAddress().toString().c_str());
     }
 
@@ -225,10 +312,14 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     {
         (void)info;
         set_status("keyboard asked for a passkey - unsupported");
+        set_hint("This keyboard wants a passkey typed on it, which this\n"
+                 "board cannot handle. Turn off passkey entry in its\n"
+                 "firmware (ZMK: CONFIG_ZMK_BLE_PASSKEY_ENTRY).");
     }
 
     void onAuthenticationComplete(NimBLEConnInfo &info) override
     {
+        g_auth_done = true;
         if (!info.isEncrypted()) {
             set_status("link not encrypted - HID needs pairing");
             return;
@@ -266,17 +357,84 @@ static void exit_suspend(NimBLERemoteService *hid)
 
 /* Subscribes to whichever input report carries key codes. Returns false if the
  * device turned out not to have a usable HID service after all. */
+#if NES_BLE_DEBUG
+#define UUID_HID_INFO ((uint16_t)0x2A4A)
+
+/* Result slot for probe_read. One static instance: the BLE task is the only
+ * caller, and a callback that arrives after a timeout must land somewhere
+ * that still exists. */
+static struct {
+    SemaphoreHandle_t done;
+    volatile int      status;
+} g_probe;
+
+static int probe_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                         struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle; (void)attr; (void)arg;
+    g_probe.status = error ? error->status : -1;
+    xSemaphoreGive(g_probe.done);
+    return 0;
+}
+
+/* Read one characteristic through the raw host API and print the status code
+ * the stack actually returned. Diagnostic only; the value is discarded. */
+static void probe_read(NimBLEClient *client, NimBLERemoteService *svc,
+                       uint16_t uuid16, const char *what)
+{
+    NimBLERemoteCharacteristic *chr = svc->getCharacteristic(NimBLEUUID(uuid16));
+    if (!chr) {
+        Serial.printf("[BLE] probe %s: characteristic absent\n", what);
+        return;
+    }
+    if (!g_probe.done) g_probe.done = xSemaphoreCreateBinary();
+    while (xSemaphoreTake(g_probe.done, 0) == pdTRUE) {}   /* drain a late give */
+
+    g_probe.status = -1;
+    int rc = ble_gattc_read(client->getConnHandle(), chr->getHandle(),
+                            probe_read_cb, nullptr);
+    if (rc == 0 && xSemaphoreTake(g_probe.done, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        Serial.printf("[BLE] probe %s: handle %u - no answer in 5 s\n", what,
+                      (unsigned)chr->getHandle());
+        return;
+    }
+    if (rc == 0) rc = g_probe.status;
+
+    /* ATT errors come back as 0x100 + the ATT code: 0x101 invalid handle,
+     * 0x105 insufficient authentication, 0x10f insufficient encryption.
+     * Anything below 0x100 is the local host giving up, not the keyboard. */
+    Serial.printf("[BLE] probe %s: handle %u rc=%d (0x%x, %s)\n", what,
+                  (unsigned)chr->getHandle(), rc, (unsigned)rc,
+                  NimBLEUtils::returnCodeToString(rc));
+}
+#endif
+
 static bool subscribe_to_keys(NimBLEClient *client)
 {
-    Serial.println("[BLE] discovering HID service...");
+    set_status("encrypted - discovering HID service...");
 
     NimBLERemoteService *hid = client->getService(NimBLEUUID(UUID_HID_SERVICE));
     if (!hid) {
         set_status("no HID service on this device");
+        set_hint("This device does not offer a HID keyboard service, so\n"
+                 "it cannot be a gamepad here. Reset the board and pick\n"
+                 "a different device in the menu.");
         return false;
     }
 
 #if NES_BLE_DEBUG
+    /* Two raw reads whose only purpose is the error code. NimBLE's readValue()
+     * hides it - an empty value is all it gives back - and "report map: 0
+     * bytes" has three unrelated causes that need three unrelated fixes:
+     * the peer says Insufficient Encryption (0x10f) although we believe the
+     * link is encrypted, the peer says Invalid Handle (0x101) because our
+     * attribute table is stale, or the host never got an answer at all (a
+     * small negative-style code, no 0x100 bit). HID Information is the one
+     * HID characteristic ZMK serves without encryption, so if it reads and
+     * the Report Map does not, the link is fine and the encryption is not. */
+    probe_read(client, hid, UUID_HID_INFO,   "HID information (plain read)");
+    probe_read(client, hid, UUID_REPORT_MAP, "report map (encrypted read)");
+
     /* Everything the HID service offers, before we touch any of it. Tells the
      * difference between "this keyboard has no boot-mode characteristic" and
      * "the subscribe call failed", which read identically from the outside.
@@ -287,9 +445,11 @@ static bool subscribe_to_keys(NimBLEClient *client)
      * this is the only thing that says which is which. */
     Serial.println("[BLE] HID characteristics:");
     for (auto *chr : hid->getCharacteristics(true)) {
-        Serial.printf("        %s  notify=%d indicate=%d",
+        Serial.printf("        %s  handle=%u notify=%d indicate=%d cccd=%d",
                       chr->getUUID().toString().c_str(),
-                      (int)chr->canNotify(), (int)chr->canIndicate());
+                      (unsigned)chr->getHandle(),
+                      (int)chr->canNotify(), (int)chr->canIndicate(),
+                      (int)(chr->getDescriptor(NimBLEUUID((uint16_t)0x2902)) != nullptr));
 
         NimBLERemoteDescriptor *ref =
             chr->getDescriptor(NimBLEUUID(UUID_REPORT_REFERENCE));
@@ -299,6 +459,8 @@ static bool subscribe_to_keys(NimBLEClient *client)
                 static const char *kind[] = { "?", "input", "output", "feature" };
                 Serial.printf("  report id=%u %s", v.data()[0],
                               v.data()[1] <= 3 ? kind[v.data()[1]] : "?");
+            } else {
+                Serial.print("  (report reference read FAILED)");
             }
         }
         Serial.println();
@@ -339,7 +501,8 @@ static bool subscribe_to_keys(NimBLEClient *client)
         hid->getCharacteristic(NimBLEUUID(UUID_BOOT_KB_INPUT));
     if (boot_in && boot_in->canNotify() && boot_in->subscribe(true, on_report)) {
         exit_suspend(hid);
-        set_status("ready (boot protocol)");
+        set_status("ready (boot protocol) - press a key on the keyboard");
+        set_hint(HINT_PRESS_A_KEY);
         g_ready = true;
         return true;
     }
@@ -356,17 +519,30 @@ static bool subscribe_to_keys(NimBLEClient *client)
     for (auto *chr : hid->getCharacteristics(true)) {
         if (chr->getUUID() != NimBLEUUID(UUID_REPORT)) continue;
         if (!chr->canNotify()) continue;
-        if (chr->subscribe(true, on_report)) subscribed++;
+        bool ok = chr->subscribe(true, on_report);
+        if (ok) subscribed++;
+#if NES_BLE_DEBUG
+        /* subscribe() is a CCCD write. On ZMK that descriptor needs an
+         * encrypted link, so a failure here and a failed report-map read
+         * above are the same fault seen twice. */
+        Serial.printf("[BLE] subscribe handle %u: %s\n",
+                      (unsigned)chr->getHandle(), ok ? "ok" : "CCCD write FAILED");
+#endif
     }
 
     if (subscribed) {
         exit_suspend(hid);
-        set_status("ready (%d report chars, no boot mode)", subscribed);
+        set_status("ready (%d input reports) - press a key on the keyboard",
+                   subscribed);
+        set_hint(HINT_PRESS_A_KEY);
         g_ready = true;
         return true;
     }
 
     set_status("HID service has no notifying input report");
+    set_hint("This device has a HID service but no input report we can\n"
+             "subscribe to, so no keys could ever arrive. Reset the board\n"
+             "and pick a different device in the menu.");
     return false;
 }
 
@@ -444,6 +620,7 @@ static bool scan_for_keyboard(void)
     if (chosen) {
         snprintf(g_name, sizeof g_name, "%s",
                  chosen_name.empty() ? "keyboard" : chosen_name.c_str());
+        set_hint("");
         set_status("found %s", g_name);
         g_target = chosen->getAddress();
         g_have_target = true;
@@ -456,7 +633,48 @@ static bool scan_for_keyboard(void)
         set_status("no HID device named '%s' - is it awake?", g_want_name);
     else
         set_status("no keyboard advertising - is it in pairing mode?");
+    set_hint("Not seen in this scan. Check the keyboard is switched on\n"
+             "and advertising: on ZMK select a FREE profile (BT_SEL n)\n"
+             "or clear the current one (BT_CLR). On a split keyboard\n"
+             "the central half is the one that talks to hosts.\n"
+             "Scanning again...");
     return false;
+}
+
+/* Encrypt the link and only report success when it actually is encrypted.
+ *
+ * NimBLE's secureConnection() parks the caller on the client's single wait
+ * slot and returns true when that slot is released with rc 0. But once the
+ * connection counts as established, EVERY GAP event for it releases that slot
+ * with rc 0: the MTU exchange finishing, the keyboard's connection-parameter
+ * update, an identity resolution. Both of the first two land within the first
+ * ~100 ms - precisely while pairing is in flight - so secureConnection()
+ * routinely returns true on a link that is not encrypted at all. On serial it
+ * looked like "link: encrypted=0" followed by every encrypted attribute
+ * failing with ATT 0x0f, Insufficient Encryption - a message that was
+ * entirely correct.
+ *
+ * The real outcome still arrives, just later: onAuthenticationComplete on
+ * success, nothing at all when the keyboard rejects the pairing. So a true
+ * that is not backed by isEncrypted() is treated as "not yet", and the wait
+ * continues here, on our own flag, with a timeout that covers a Just Works
+ * exchange several times over. */
+static bool secure_link(void)
+{
+    g_auth_done = false;
+    g_auth_status = -1;
+    set_status("pairing / encrypting...");
+    bool ok = g_client->secureConnection();
+    if (ok && !g_client->getConnInfo().isEncrypted()) {
+        Serial.println("[BLE] secureConnection() returned before encryption - "
+                       "waiting for the real result");
+        for (int i = 0; i < 100 && !g_auth_done && g_client->isConnected(); i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        ok = g_client->isConnected() && g_client->getConnInfo().isEncrypted();
+        if (!ok && !g_auth_done)
+            Serial.println("[BLE] no pairing verdict in 10 s");
+    }
+    return ok;
 }
 
 static bool connect_to_target(void)
@@ -479,12 +697,14 @@ static bool connect_to_target(void)
     }
 
     if (!g_client->connect(g_target)) {
-        set_status("connect failed");
+        set_status("connect failed - retrying");
+        set_hint("Found it, but the connection did not come up. It may be\n"
+                 "busy with another host or out of range. Retrying.");
         return false;
     }
 
     /* HID characteristics are unreadable until the link is encrypted. */
-    if (!g_client->secureConnection()) {
+    if (!secure_link()) {
         /* Almost always a one-sided bond: we kept a key that the keyboard has
          * since forgotten - ZMK's BT_CLR wipes one profile and says nothing to
          * the host that was on it. Encryption then fails forever, because both
@@ -500,24 +720,64 @@ static bool connect_to_target(void)
         if (NimBLEDevice::isBonded(g_target)) {
             NimBLEDevice::deleteBond(g_target);
             set_status("stale key dropped - now clear it on the keyboard");
+            set_hint("Our pairing key was rejected, so it has been dropped.\n"
+                     "Now clear the keyboard's side too: on ZMK, select the\n"
+                     "profile this board was on and press BT_CLR, or press\n"
+                     "BT_CLR_ALL. Then reset this board.");
             Serial.println(
                 "[BLE] We held a pairing key the keyboard no longer accepts, so\n"
                 "      ours is gone now. Clear its side too - on ZMK that is\n"
                 "      &bt BT_CLR while ITS profile for this board is selected.");
+        } else if (g_auth_status == ST_PEER_AUTH_REQUIREMENTS) {
+            /* Zephyr's update_keys_check(): a stored bond for our address may
+             * not be replaced by an unauthenticated (Just Works) pairing unless
+             * the keyboard was built with CONFIG_BT_SMP_ALLOW_UNAUTH_OVERWRITE,
+             * which ZMK leaves off. The bond is found by OUR address, on ANY
+             * profile - so BT_CLR on the active profile does nothing unless
+             * that profile is the one holding it. */
+            set_status("keyboard keeps an old bond for us - BT_CLR_ALL");
+            set_hint("The keyboard still keeps a pairing key for this board\n"
+                     "and will not replace it with a new one.\n"
+                     "On ZMK: press BT_CLR_ALL, or BT_CLR while the profile\n"
+                     "this board was on is selected. Then reset this board.");
+            Serial.println(
+                "[BLE] The keyboard still holds a pairing key for this board\n"
+                "      and Zephyr will not let a new Just Works pairing replace\n"
+                "      it. That key can sit on ANY of its profiles, and &bt\n"
+                "      BT_CLR only clears the ACTIVE one - so either select the\n"
+                "      profile this board was on and BT_CLR there, or use\n"
+                "      &bt BT_CLR_ALL. Then power-cycle this board.");
         } else {
             set_status("keyboard refuses to pair - clear its profile");
+            set_hint("The keyboard refuses to pair. On ZMK its ACTIVE profile\n"
+                     "is probably taken by another host: select a free one\n"
+                     "(BT_SEL n) or clear it (BT_CLR). Then reset this board.");
             Serial.println(
                 "[BLE] We hold no key for this keyboard, and it will not pair:\n"
                 "      it still has a bond for us and considers that profile\n"
                 "      taken. Only the keyboard can drop it - select the profile\n"
-                "      this board was on and press &bt BT_CLR, then power-cycle\n"
-                "      the board. Nothing on this end can force it.");
+                "      this board was on and press &bt BT_CLR (or &bt BT_CLR_ALL),\n"
+                "      then power-cycle the board. Nothing on this end can force it.");
         }
         g_expect_disconnect = true;
         g_client->disconnect();
         g_have_target = false;      /* rescan: the address may have rotated */
         return false;
     }
+
+#if NES_BLE_DEBUG
+    /* What the stack believes about the link before anything is read from it.
+     * secureConnection() reporting success while the peer still refuses
+     * encrypted attributes is the case this is here to catch. */
+    {
+        NimBLEConnInfo ci = g_client->getConnInfo();
+        Serial.printf("[BLE] link: encrypted=%d authenticated=%d bonded=%d "
+                      "keysize=%u mtu=%u interval=%u\n",
+                      (int)ci.isEncrypted(), (int)ci.isAuthenticated(),
+                      (int)ci.isBonded(), (unsigned)ci.getSecKeySize(),
+                      (unsigned)ci.getMTU(), (unsigned)ci.getConnInterval());
+    }
+#endif
 
     if (!subscribe_to_keys(g_client)) {
         g_expect_disconnect = true;
@@ -566,6 +826,7 @@ static void ble_task(void *arg)
              * rather than leaving a silent screen to be interpreted. */
             if (++silent_ticks >= 5 && !warned) {
                 warned = true;
+                set_status("linked, but no keys in 5 s - is our profile active?");
                 Serial.println(
                     "[BLE] linked and subscribed, but no reports in 5 s.\n"
                     "      On ZMK a keyboard stays connected to EVERY bonded\n"
@@ -588,6 +849,7 @@ void ble_keyboard_init(void)
      * connections because every stack from the last decade supports it. */
     NimBLEDevice::setSecurityAuth(true, false, true);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    NimBLEDevice::setCustomGapHandler(gap_listener);
 
     /* What we already remember, so a pairing failure can be read against it
      * rather than guessed at. Bonds live in NVS and survive reflashing the
@@ -708,14 +970,20 @@ int ble_keyboard_buttons(void)
 
 bool ble_keyboard_connected(void)
 {
-    /* g_ready, not g_link_up: callers use this to decide whether the keyboard
-     * can actually play, and a linked-but-silent keyboard cannot. */
-    return g_ready;
+    /* Reports actually arriving, not merely g_ready: a ZMK keyboard on a
+     * non-active profile is encrypted, subscribed and silent, and the wait
+     * screen must not end there. One key press proves the whole chain. */
+    return g_ready && g_reports > 0;
 }
 
 const char *ble_keyboard_status(void)
 {
     return g_status;
+}
+
+const char *ble_keyboard_hint(void)
+{
+    return g_hint;
 }
 
 #else  /* NES_BLE_KEYBOARD disabled */
@@ -742,6 +1010,7 @@ const char *ble_keyboard_target_name(void)  { return ""; }
 int         ble_keyboard_buttons(void)      { return 0; }
 bool        ble_keyboard_connected(void)    { return false; }
 const char *ble_keyboard_status(void)       { return "disabled"; }
+const char *ble_keyboard_hint(void)         { return ""; }
 bool        ble_keyboard_menu(void)         { return false; }
 
 #endif /* NES_BLE_KEYBOARD */

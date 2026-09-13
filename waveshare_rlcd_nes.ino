@@ -99,15 +99,17 @@ bool mount_card()
 #endif
 
 #if NES_BLE_KEYBOARD
-/* Shows what the BLE task is doing, until it connects or you get bored.
+/* Shows what the BLE task is doing, until the keyboard delivers keys or a
+ * button is held. With NES_BLE_WAIT_FOREVER there is no third way out.
  *
  * Worth the wait screen rather than just booting: pairing is the one step that
  * genuinely can fail (keyboard not in pairing mode, a stale bond on one side),
- * and the failure is silent unless someone is watching the serial log. Any
- * button skips - the game does not need a keyboard to start. */
+ * and the failure is silent unless someone is watching the serial log. Holding
+ * a button skips - the game does not need a keyboard to start. */
 static void wait_for_keyboard(uint32_t timeout_ms)
 {
     if (timeout_ms == 0) return;
+    const bool forever = (timeout_ms == NES_BLE_WAIT_FOREVER);
 
     /* A button still held from the picker would otherwise read as "skip" the
      * instant this starts, and the wait would look like it never happened. */
@@ -119,6 +121,7 @@ static void wait_for_keyboard(uint32_t timeout_ms)
      * never redraw again. */
     char shown[64] = "";
     int  shown_left = -1;
+    const char *shown_hint = nullptr;   /* a literal: pointer identity is enough */
     const uint32_t started = millis();
 
     const char *why = "connected";
@@ -126,7 +129,7 @@ static void wait_for_keyboard(uint32_t timeout_ms)
 
     while (!ble_keyboard_connected()) {
         const uint32_t elapsed = millis() - started;
-        if (elapsed >= timeout_ms) { why = "timed out"; break; }
+        if (!forever && elapsed >= timeout_ms) { why = "timed out"; break; }
 
         /* Held, not merely seen. A stray byte from the serial pad - a terminal
          * echoing a newline is enough - counts as START for 90 ms, and that was
@@ -139,14 +142,19 @@ static void wait_for_keyboard(uint32_t timeout_ms)
         }
 
         const char *now  = ble_keyboard_status();
-        const int   left = (int)((timeout_ms - elapsed) / 1000);
+        const char *hint = ble_keyboard_hint();
+        /* Counts down to the timeout, or up from the start when there is none.
+         * Either way it moves once a second, which is the point of it. */
+        const int   secs = forever ? (int)(elapsed / 1000)
+                                   : (int)((timeout_ms - elapsed) / 1000);
 
         /* Redraw on a status change or once a second - a flush costs 6.5 ms and
          * the panel only scans at 17 Hz, so there is nothing to gain from
          * going faster, and a visibly counting number is what distinguishes
          * "still working" from "hung". */
-        if (left != shown_left || strncmp(now, shown, sizeof shown) != 0) {
-            char line[48];
+        if (secs != shown_left || hint != shown_hint ||
+            strncmp(now, shown, sizeof shown) != 0) {
+            char line[64];
 
             tft.fillScreen(TFT_WHITE);
             tft.drawFilledRect(0, 0, DISPLAY_WIDTH, 26, TFT_BLACK);
@@ -154,37 +162,60 @@ static void wait_for_keyboard(uint32_t timeout_ms)
 
             tft.drawString(20, 60, now, TFT_BLACK, TFT_WHITE, 1);
 
-            snprintf(line, sizeof line, "STARTING IN %d S", left);
+            snprintf(line, sizeof line,
+                     forever ? "WAITING %d S" : "STARTING IN %d S", secs);
             tft.drawString(20, 90, line, TFT_BLACK, TFT_WHITE, 2);
 
-            tft.drawString(20, 140, "WASD    F   G", TFT_BLACK,
-                           TFT_WHITE, 1);
-            tft.drawString(20, 156, "4 - SELECT       5 - START", TFT_BLACK,
-                           TFT_WHITE, 1);
+            if (hint[0]) {
+                /* Something needs doing on the keyboard's side, and this is
+                 * the only screen anyone is looking at while it does. The
+                 * advice takes the legend's place: one is for when things
+                 * work, the other for when they do not, and they are never
+                 * both true. Lines come '\n'-separated, at most five, each
+                 * short enough for the small font at this margin. */
+                int y = 124;
+                const char *p = hint;
+                while (*p && y <= 236) {
+                    const char *nl = strchr(p, '\n');
+                    const size_t n = nl ? (size_t)(nl - p) : strlen(p);
+                    const size_t k = n < sizeof line - 1 ? n : sizeof line - 1;
+                    memcpy(line, p, k);
+                    line[k] = '\0';
+                    tft.drawString(20, y, line, TFT_BLACK, TFT_WHITE, 1);
+                    y += 16;
+                    p = nl ? nl + 1 : p + n;
+                }
+            } else {
+                tft.drawString(20, 140, "WASD    F   G", TFT_BLACK,
+                               TFT_WHITE, 1);
+                tft.drawString(20, 156, "4 - SELECT       5 - START",
+                               TFT_BLACK, TFT_WHITE, 1);
 
-            /* The in-game chords, listed here because this screen is the only
-             * one the player is looking at with nothing else to do, and none of
-             * them is discoverable by pressing things at random. SELECT is 4,
-             * so every one of them starts with 4 - which is worth showing as
-             * the key rather than as the pad name, since the key is what the
-             * hand is on. */
-            tft.drawString(20, 184, "IN GAME", TFT_BLACK, TFT_WHITE, 1);
-            tft.drawString(20, 200, "4+F  DITHER MODE     4+G  INVERT",
-                           TFT_BLACK, TFT_WHITE, 1);
-            tft.drawString(20, 216, "4+W / 4+S  BRIGHTNESS",
-                           TFT_BLACK, TFT_WHITE, 1);
-            tft.drawString(20, 232, "4+5 HELD   BACK TO THE ROM LIST",
-                           TFT_BLACK, TFT_WHITE, 1);
+                /* The in-game chords, listed here because this screen is the
+                 * only one the player is looking at with nothing else to do,
+                 * and none of them is discoverable by pressing things at
+                 * random. SELECT is 4, so every one of them starts with 4 -
+                 * which is worth showing as the key rather than as the pad
+                 * name, since the key is what the hand is on. */
+                tft.drawString(20, 184, "IN GAME", TFT_BLACK, TFT_WHITE, 1);
+                tft.drawString(20, 200, "4+F  DITHER MODE     4+G  INVERT",
+                               TFT_BLACK, TFT_WHITE, 1);
+                tft.drawString(20, 216, "4+W / 4+S  BRIGHTNESS",
+                               TFT_BLACK, TFT_WHITE, 1);
+                tft.drawString(20, 232, "4+5 HELD   BACK TO THE ROM LIST",
+                               TFT_BLACK, TFT_WHITE, 1);
+            }
 
-            tft.drawString(20, 262, "HOLD ANY BUTTON TO SKIP - IT KEEPS",
+            tft.drawString(20, 262, "HOLD ANY BUTTON TO PLAY WITHOUT IT -",
                            TFT_BLACK, TFT_WHITE, 1);
-            tft.drawString(20, 278, "CONNECTING IN THE BACKGROUND ANYWAY",
+            tft.drawString(20, 278, "IT KEEPS CONNECTING IN THE BACKGROUND",
                            TFT_BLACK, TFT_WHITE, 1);
             tft.flush();
 
             strncpy(shown, now, sizeof shown - 1);
             shown[sizeof shown - 1] = '\0';
-            shown_left = left;
+            shown_left = secs;
+            shown_hint = hint;
         }
         delay(60);
     }
@@ -270,8 +301,9 @@ void setup()
 
 #if NES_BLE_KEYBOARD
     /* Skipped when the picker was told to play without one - there would be
-     * nothing to wait for. */
-    if (want_keyboard) wait_for_keyboard(12000);
+     * nothing to wait for. Otherwise the ROM browser does not open until the
+     * keyboard is delivering keys or a button is held - see NES_BLE_WAIT_MS. */
+    if (want_keyboard) wait_for_keyboard(NES_BLE_WAIT_MS);
 #endif
 
     /* MENU, GAME, MENU AGAIN. It used to be menu-then-game-forever, with the

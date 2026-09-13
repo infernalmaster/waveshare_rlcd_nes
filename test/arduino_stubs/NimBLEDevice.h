@@ -29,6 +29,43 @@
 #define BLE_HS_IO_DISPLAY_ONLY    0x00
 #define BLE_HS_IO_KEYBOARD_ONLY   0x02
 
+/* host/ble_gatt.h - the raw client read used by the diagnostic probe. The
+ * callback runs once, with status 0 and the attribute, or with the error and
+ * no attribute. */
+struct os_mbuf;
+struct ble_gatt_error {
+    uint16_t status;
+    uint16_t att_handle;
+};
+struct ble_gatt_attr {
+    uint16_t        handle;
+    uint16_t        offset;
+    struct os_mbuf *om;
+};
+typedef int ble_gatt_attr_fn(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr, void *arg);
+int ble_gattc_read(uint16_t conn_handle, uint16_t attr_handle,
+                   ble_gatt_attr_fn *cb, void *cb_arg);
+
+/* host/ble_gap.h - only what a GAP event listener needs. */
+#define BLE_GAP_EVENT_ENC_CHANGE 4
+struct ble_gap_event {
+    uint8_t type;
+    union {
+        struct {
+            int      status;
+            uint16_t conn_handle;
+        } enc_change;
+    };
+};
+typedef int (*gap_event_handler)(ble_gap_event *event, void *arg);
+
+class NimBLEUtils {
+public:
+    static const char *returnCodeToString(int rc);
+};
+
 class NimBLEUUID {
 public:
     NimBLEUUID() = default;
@@ -47,9 +84,12 @@ public:
 
 class NimBLEConnInfo {
 public:
-    bool isBonded() const;
-    bool isEncrypted() const;
-    bool isAuthenticated() const;
+    uint16_t getConnInterval() const;
+    uint16_t getMTU() const;
+    bool     isBonded() const;
+    bool     isEncrypted() const;
+    bool     isAuthenticated() const;
+    uint8_t  getSecKeySize() const;
 };
 
 class NimBLEAdvertisedDevice {
@@ -163,6 +203,8 @@ public:
                                              uint16_t scanInterval = 16,
                                              uint16_t scanWindow = 16);
     NimBLERemoteService *getService(const NimBLEUUID &uuid);
+    uint16_t             getConnHandle() const;
+    NimBLEConnInfo       getConnInfo() const;
 };
 
 class NimBLEDevice {
@@ -175,6 +217,8 @@ public:
     static void          setSecurityAuth(bool bonding, bool mitm, bool sc);
     static void          setSecurityAuth(uint8_t auth);
     static void          setSecurityIOCap(uint8_t iocap);
+    static bool          setCustomGapHandler(gap_event_handler handler,
+                                             void *arg = nullptr);
 
     /* Bond storage. These live in NVS and outlive a sketch upload, which is
      * what makes a one-sided bond possible in the first place. */

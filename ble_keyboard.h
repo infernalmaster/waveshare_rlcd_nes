@@ -82,6 +82,11 @@ bool ble_keyboard_connected(void);
 /* One line for a status display. Never NULL. */
 const char *ble_keyboard_status(void);
 
+/* What to do about the current status, as up to five '\n'-separated lines of
+ * at most 60 characters, or "" when there is nothing to advise. A string
+ * literal, so comparing pointers is enough to notice a change. Never NULL. */
+const char *ble_keyboard_hint(void);
+
 /* Picks a keyboard on the panel and saves the choice. Call between init() and
  * begin() - scanning has to finish before the background task starts, or the
  * two fight over the radio. Returns false if the user chose to play without

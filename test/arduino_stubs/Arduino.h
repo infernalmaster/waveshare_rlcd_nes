@@ -56,6 +56,14 @@ int  xTaskCreatePinnedToCore(void (*fn)(void *), const char *name,
                              uint32_t stack, void *arg, unsigned prio,
                              TaskHandle_t *handle, int core);
 
+/* Binary semaphores, as the raw-GATT probe in ble_keyboard.cpp waits on one.
+ * On the target these are macros over the generic queue API; here they are
+ * plain functions with the same argument shapes and return values. */
+typedef void *SemaphoreHandle_t;
+SemaphoreHandle_t xSemaphoreCreateBinary(void);
+int  xSemaphoreTake(SemaphoreHandle_t sem, TickType_t ticks);
+int  xSemaphoreGive(SemaphoreHandle_t sem);
+
 /* Macros, not templates - matching the core, which means mixed-type arguments
  * like min(200, some_int) compile here exactly as they do on the target. */
 #ifndef min
